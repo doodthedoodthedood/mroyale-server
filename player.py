@@ -4,6 +4,7 @@ import re
 import emoji
 from twisted.internet import reactor
 from buffer import Buffer
+import util
 
 try:
     from discord_webhook import DiscordEmbed
@@ -11,35 +12,23 @@ except Exception as e:
     pass
 
 class Player(object):
-    def __init__(self, client, name, team, match, skin, gm):
+    def __init__(self, client, name, team, match, skin, gm, isDev):
         self.client = client
         self.server = client.server
         self.match = match
         self.skin = skin
         self.gameMode = gm
+        self.isDev = isDev
         
         self.name = ' '.join(emoji.emojize(re.sub(r"[^\x00-\x7F]+", "", emoji.demojize(name)).strip())[:20].split()).upper()
         self.team = team
-        if len(self.team) > 0 and self.server.checkCurse(self.name):
+        if len(self.team) > 0 and not isDev and util.checkCurse(self.name):
             self.name = str()
         if len(self.name) == 0:
             self.name = self.server.defaultName if self.client.username != "" else ("【G】"+self.server.defaultName)
         elif len(self.client.username) == 0:
             self.name = "【G】" + self.name
-        if self.client.username.lower() in ["taliondiscord",
-                                            "damonj17",
-                                            "ddmil@marioroyale:~$",
-                                            "pixelcraftian",
-                                            "igor",
-                                            "minus",
-                                            "cyuubi",
-                                            "gyorokpeter",
-                                            "zizzydizzymc",
-                                            "nuts & milk",
-                                            "jupitersky",
-                                            "nethowarrior",
-                                            "real novex",
-                                            "nightyoshi370"]:
+        if isDev:
             self.name = "【𝐃𝐄𝐕】" + self.name
         elif self.skin in [52]:
             self.skin = 0
@@ -54,6 +43,10 @@ class Player(object):
         self.loaded = bool()
         self.lobbier = bool()
         self.lastUpdatePkt = None
+        self.wins = 0
+        self.deaths = 0
+        self.kills = 0
+        self.coins = 0
 
         self.trustCount = int()
         self.lastX = int()
@@ -64,6 +57,9 @@ class Player(object):
     def sendJSON(self, j):
         self.client.sendJSON(j)
 
+    def sendText(self, t):
+        self.client.sendText(t)
+
     def sendBin(self, code, b):
         self.client.sendBin(code, b)
 
@@ -71,16 +67,13 @@ class Player(object):
         return {"id": self.id, "name": self.name, "team": self.team}
 
     def serializePlayerObject(self):
-        return Buffer().writeInt16(self.id).writeInt8(self.level).writeInt8(self.zone).writeShor2(self.posX, self.posY).writeInt16(self.skin).toBytes()
+        return Buffer().writeInt16(self.id).writeInt8(self.level).writeInt8(self.zone).writeShor2(self.posX, self.posY).writeInt16(self.skin).writeInt8(self.isDev).toBytes()
 
-    def loadWorld(self, worldName, levelData):
+    def loadWorld(self, worldName, loadMsg):
         self.dead = True
         self.loaded = False
         self.pendingWorld = worldName
-        msg = {"game": worldName, "type": "g01"}
-        if worldName == "custom":
-            msg["levelData"] = levelData
-        self.sendJSON({"packets": [msg], "type": "s01"})
+        self.sendText(loadMsg)
         self.client.startDCTimer(15)
 
     def setStartTimer(self, time):
@@ -92,11 +85,18 @@ class Player(object):
         if not self.dead:
             return
         
-        if self.match.world == "lobby":
-            self.lobbier = True
+        self.lobbier = self.match.isLobby
 
         self.match.onPlayerEnter(self)
-        self.loadWorld(self.match.world, self.match.customLevelData)
+        self.loadWorld(self.match.world, self.match.getLoadMsg())
+        if (self.server.enableLevelSelectInMultiPrivate or self.team == "") and self.match.private:
+            self.sendLevelSelect()
+
+    def sendLevelSelect(self):
+        levelList = self.server.getLevelList("game", self.match.levelMode)
+        levelDicts = [{"shortId":self.server.levels[x]["shortname"], "longId":x} for x in levelList]
+        levelDicts.sort(key=lambda x: x["shortId"])
+        self.sendJSON({"type": "gll", "levels": levelDicts})
 
     def onLoadComplete(self):
         if self.loaded or self.pendingWorld is None:
@@ -104,6 +104,7 @@ class Player(object):
 
         self.client.stopDCTimer()
         
+        self.lobbier = self.match.isLobby
         self.level = 0
         self.zone = 0
         self.posX = 35
@@ -114,7 +115,7 @@ class Player(object):
         self.pendingWorld = None
         self.lastXOk = True
         
-        self.sendBin(0x02, Buffer().writeInt16(self.id).writeInt16(self.skin)) # ASSIGN_PID
+        self.sendBin(0x02, Buffer().writeInt16(self.id).writeInt16(self.skin).writeInt8(self.isDev)) # ASSIGN_PID
 
         self.match.onPlayerReady(self)
 
@@ -123,19 +124,21 @@ class Player(object):
             level, zone, pos = b.readInt8(), b.readInt8(), b.readShor2()
             self.level = level
             self.zone = zone
-            
+            self.posX = pos[0]
+            self.posY = pos[1]
+
             self.dead = False
             self.client.stopDCTimer()
-            
-            self.match.broadBin(0x10, Buffer().writeInt16(self.id).write(pktData).writeInt16(self.skin))
+            self.match.broadBin(0x10, self.serializePlayerObject())
 
         elif code == 0x11: # KILL_PLAYER_OBJECT
             if self.dead or self.win:
                 return
-            
+
             self.dead = True
             self.client.startDCTimer(60)
-            
+
+            self.addDeath()
             self.match.broadBin(0x11, Buffer().writeInt16(self.id))
             
         elif code == 0x12: # UPDATE_PLAYER_OBJECT
@@ -180,6 +183,7 @@ class Player(object):
             if killer is None:
                 return
 
+            killer.addKill()
             killer.sendBin(0x17, Buffer().writeInt16(self.id).write(pktData))
 
         elif code == 0x18: # PLAYER_RESULT_REQUEST
@@ -190,12 +194,14 @@ class Player(object):
             self.client.startDCTimer(120)
 
             pos = self.match.getWinners()
+            if pos == 1:
+                self.addWin()
             try:
                 # Maybe this should be assynchronous?
                 if self.server.discordWebhook is not None and pos == 1 and not self.match.private:
                     name = self.name
                     # We already filter players that have a squad so...
-                    if len(self.team) == 0 and self.server.checkCurse(self.name):
+                    if len(self.team) == 0 and not isDev and util.checkCurse(self.name):
                         name = "[ censored ]"
                     embed = DiscordEmbed(description='**%s** has achieved **#1** victory royale!%s' % (name, " (PVP Mode)" if self.gameMode == 1 else " (Hell mode)" if self.gameMode == 2 else ""), color=0xffff00)
                     self.server.discordWebhook.add_embed(embed)
@@ -218,18 +224,31 @@ class Player(object):
             if self.dead:
                 return
 
-            level, zone, oid, type = b.readInt8(), b.readInt8(), b.readInt32(), b.readInt8()
-
-            if self.match.world == "lobby" and oid == 458761:
-                self.match.goldFlowerTaken = True
-
-            self.match.broadBin(0x20, Buffer().writeInt16(self.id).write(pktData))
+            self.match.objectEventTrigger(self, b, pktData)
             
         elif code == 0x30: # TILE_EVENT_TRIGGER
             if self.dead:
                 return
 
-            level, zone, pos, type = b.readInt8(), b.readInt8(), b.readShor2(), b.readInt8()
+            self.match.tileEventTrigger(self, b, pktData)
 
-            self.match.broadBin(0x30, Buffer().writeInt16(self.id).write(pktData))
+    def addCoin(self):
+        if not self.lobbier:
+            self.coins += 1
+        self.sendBin(0x21, Buffer().writeInt8(0))
+
+    def addWin(self):
+        if not self.lobbier:
+            self.wins += 1
+			self.coins += 200
+
+    def addDeath(self):
+        if not self.lobbier:
+            self.deaths += 1
+			self.coins -= 10
+
+    def addKill(self):
+        if not self.lobbier:
+            self.kills += 1
+			self.coins += 10
 
